@@ -27,6 +27,8 @@ const state = {
     reservoirReadingAvailable: false,
     phIsRawAdc: false,
     turbidityIsRawAdc: false,
+    ntuCleanMax: 10,
+    ntuCloudyMax: 50,
     pumps: {
         pump1: false,
         pump2: false,
@@ -218,7 +220,7 @@ function updateSensorLabels(data) {
     if (turbidityRange) {
         turbidityRange.innerHTML = state.turbidityIsRawAdc
             ? "<span>ADC · 0</span><span>RAW SENSOR VALUE</span><span>ADC · 4095</span>"
-            : "<span>BERSIH: 0-10 NTU</span><span>KERUH: 11-50 NTU</span><span>KOTOR: >50 NTU</span>";
+            : `<span>BERSIH: 0-${state.ntuCleanMax} NTU</span><span>KERUH: ${state.ntuCleanMax}-${state.ntuCloudyMax} NTU</span><span>KOTOR: &gt;${state.ntuCloudyMax} NTU</span>`;
     }
     setText("moistureValue", `${data.moisture}%`);
 }
@@ -236,8 +238,8 @@ function updateTankVisuals(data) {
 }
 
 function getTurbidityCategory(value) {
-    if (value >= 0 && value <= 10) return { label: "BERSIH", className: "state-good" };
-    if (value <= 50) return { label: "KERUH", className: "state-warning" };
+    if (value >= 0 && value <= state.ntuCleanMax) return { label: "BERSIH", className: "state-good" };
+    if (value <= state.ntuCloudyMax) return { label: "KERUH", className: "state-warning" };
     return { label: "KOTOR", className: "state-danger" };
 }
 
@@ -253,8 +255,8 @@ function evaluateWater(data) {
     }
 
     // Demonstration thresholds only. Not a drinking-water certification.
-    const passed = data.turbidity >= 0 && data.turbidity <= 10;
-    const moderate = data.turbidity > 10 && data.turbidity <= 50;
+    const passed = data.turbidity >= 0 && data.turbidity <= state.ntuCleanMax;
+    const moderate = data.turbidity > state.ntuCleanMax && data.turbidity <= state.ntuCloudyMax;
     const category = getTurbidityCategory(data.turbidity);
     cleanQualityStatus.textContent = category.label;
     setStateClass(cleanQualityStatus, category.className);
@@ -840,6 +842,7 @@ function initializeProfileSettings() {
     if (savedUsername) usernameDisplay.textContent = savedUsername;
     usernameInput.value = usernameDisplay.textContent;
     let tankSettingsLoaded = false;
+    let ntuSettingsLoaded = false;
     const tankSettingFields = [
         ["tank1FullSetting", "TANKI 1 FULL"],
         ["tank1EmptySetting", "TANKI 1 KOSONG"],
@@ -872,12 +875,44 @@ function initializeProfileSettings() {
         }
     }
 
+    async function loadNtuSettings() {
+        if (ntuSettingsLoaded) return;
+        const status = $("ntuSettingsStatus");
+        status.textContent = "Memuat pengaturan...";
+        const path = `${firebaseConfig.databaseURL}/ecowast/${encodeURIComponent("NTU SETTING")}.json`;
+        try {
+            let settings;
+            try {
+                settings = await firebaseJsonRequest(`${path}?auth=${encodeURIComponent(await getFirebaseIdToken())}`);
+            } catch (error) {
+                if (error.status !== 401) throw error;
+                settings = await firebaseJsonRequest(`${path}?auth=${encodeURIComponent(await getFirebaseIdToken(true))}`);
+            }
+            if (settings && typeof settings === "object") {
+                const clean = Number(settings["NTU BERSIH"] ?? settings["NTU AIR BERSIH MAX"]);
+                const cloudy = Number(settings["NTU KERUH"] ?? 50);
+                if (Number.isFinite(clean) && Number.isFinite(cloudy)) {
+                    state.ntuCleanMax = clean;
+                    state.ntuCloudyMax = cloudy;
+                    $("ntuCleanSetting").value = String(clean);
+                    $("ntuCloudySetting").value = String(cloudy);
+                    updateDashboard();
+                }
+            }
+            ntuSettingsLoaded = true;
+            status.textContent = settings ? "Pengaturan Firebase dimuat." : "Isi batas NTU lalu tekan KIRIM.";
+        } catch (error) {
+            status.textContent = "Gagal memuat. Isi batas NTU lalu tekan KIRIM.";
+        }
+    }
+
     settingsToggle.addEventListener("click", () => {
         const open = settingsPanel.hidden;
         settingsPanel.hidden = !open;
         settingsToggle.setAttribute("aria-expanded", String(open));
         if (open) usernameInput.focus();
         if (open) loadTankSettings();
+        if (open) loadNtuSettings();
     });
 
     $("sendTankSettings").addEventListener("click", async () => {
@@ -909,6 +944,40 @@ function initializeProfileSettings() {
             }
             tankSettingsLoaded = true;
             status.textContent = "Pengaturan berhasil dikirim ke Firebase.";
+        } catch (error) {
+            status.textContent = `Gagal mengirim: ${error.message || "periksa koneksi Firebase"}`;
+        }
+    });
+
+    $("sendNtuSettings").addEventListener("click", async () => {
+        const status = $("ntuSettingsStatus");
+        const clean = $("ntuCleanSetting").valueAsNumber;
+        const cloudy = $("ntuCloudySetting").valueAsNumber;
+        if (!Number.isFinite(clean) || !Number.isFinite(cloudy)) {
+            status.textContent = "Masukkan nilai angka yang valid untuk kedua pengaturan NTU.";
+            return;
+        }
+
+        const values = { "NTU BERSIH": clean, "NTU KERUH": cloudy };
+        const path = `${firebaseConfig.databaseURL}/ecowast/${encodeURIComponent("NTU SETTING")}.json`;
+        const send = (token) => firebaseJsonRequest(`${path}?auth=${encodeURIComponent(token)}`, {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(values)
+        });
+        status.textContent = "Mengirim ke Firebase...";
+        try {
+            try {
+                await send(await getFirebaseIdToken());
+            } catch (error) {
+                if (error.status !== 401) throw error;
+                await send(await getFirebaseIdToken(true));
+            }
+            state.ntuCleanMax = clean;
+            state.ntuCloudyMax = cloudy;
+            ntuSettingsLoaded = true;
+            updateDashboard();
+            status.textContent = "NTU SETTING berhasil dikirim ke Firebase.";
         } catch (error) {
             status.textContent = `Gagal mengirim: ${error.message || "periksa koneksi Firebase"}`;
         }
