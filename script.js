@@ -7,6 +7,97 @@
 
 const $ = (id) => document.getElementById(id);
 
+function initializeLogin() {
+    const form = $("loginForm");
+    const screen = $("loginScreen");
+    const error = $("loginError");
+    if (!form || !screen) return false;
+
+    form.addEventListener("submit", (event) => {
+        event.preventDefault();
+        if ($("loginUsername").value.trim().toUpperCase() !== "PEDRO" || $("loginPassword").value !== "PEDRO123") {
+            error.hidden = false;
+            $("loginPassword").value = "";
+            $("loginPassword").focus();
+            return;
+        }
+        error.hidden = true;
+        $("loginLock").classList.add("is-unlocked");
+        $("dashboardLock")?.classList.add("is-unlocked");
+        form.querySelector("button[type=submit]").disabled = true;
+        $("operatorUsername").textContent = "PEDRO";
+        window.setTimeout(() => {
+            screen.hidden = true;
+            initializeDashboard();
+        }, 650);
+    });
+    return true;
+}
+
+function initializeDashboard() {
+    updateDashboard();
+    updateWelcomeDate();
+    initializeProfileSettings();
+    initializeSensorCarousel();
+    initializePageSelector();
+    initializeAutomationSettings();
+    initializeManualSensorControls();
+    initializeModeratorPumpControls();
+    initializeModeratorAccess();
+    syncFirebaseSensors();
+    setInterval(syncFirebaseSensors, 2000);
+    updateClock();
+    setInterval(updateClock, 1000);
+    window.addEventListener("resize", updateDashboard);
+}
+
+function initializeModeratorAccess() {
+    const screen = $("moderatorScreen");
+    const form = $("moderatorForm");
+    const intro = $("moderatorIntro");
+    const dashboard = $("moderatorDashboard");
+    const error = $("moderatorError");
+    if (!screen || !form || form.dataset.initialized) return;
+    form.dataset.initialized = "true";
+    let introTimer = 0;
+
+    $("moderatorTrigger").addEventListener("click", () => {
+        window.clearTimeout(introTimer);
+        screen.hidden = false;
+        form.hidden = false;
+        intro.hidden = true;
+        dashboard.hidden = true;
+        error.hidden = true;
+        $("moderatorPassword").value = "";
+        window.setTimeout(() => $("moderatorPassword").focus(), 0);
+    });
+    const close = () => {
+        window.clearTimeout(introTimer);
+        screen.hidden = true;
+    };
+    $("moderatorCancel").addEventListener("click", close);
+    $("moderatorBack").addEventListener("click", close);
+    document.addEventListener("keydown", (event) => {
+        if (event.key === "Escape" && !screen.hidden) close();
+    });
+    form.addEventListener("submit", (event) => {
+        event.preventDefault();
+        if ($("moderatorPassword").value !== "DANIS") {
+            error.hidden = false;
+            $("moderatorPassword").value = "";
+            $("moderatorPassword").focus();
+            return;
+        }
+        error.hidden = true;
+        form.hidden = true;
+        intro.hidden = false;
+        introTimer = window.setTimeout(() => {
+            intro.hidden = true;
+            dashboard.hidden = false;
+        }, 1400);
+    });
+}
+
 const elements = {
     ph: $("ph"),
     turbidity: $("turbidity"),
@@ -23,6 +114,9 @@ const elements = {
 const state = {
     firebaseLive: false,
     firebaseDataLoaded: false,
+    manualSensorModes: {},
+    manualSensorOverrides: {},
+    originalSensorValues: {},
     reservoirFull: false,
     reservoirReadingAvailable: false,
     phIsRawAdc: false,
@@ -38,6 +132,220 @@ const state = {
     }
 };
 state.irrigationActive = false;
+
+const manualSensorFields = {
+    ph: { inputId: "manualPh", min: 0, max: 14 },
+    turbidity: { inputId: "manualTurbidity", min: 0, max: 500 },
+    tank1: { inputId: "manualTank1", min: 0, max: 100 },
+    tank2: { inputId: "manualTank2", min: 0, max: 100 },
+    moisture: { inputId: "manualMoisture", min: 0, max: 100 },
+    temperature: { inputId: "manualTemperature", min: 0, max: 50 },
+    humidity: { inputId: "manualHumidity", min: 0, max: 100 }
+};
+
+function getDisplayedSensorValue(key) {
+    if (["ph", "turbidity", "tank1", "tank2", "moisture"].includes(key)) return Number(elements[key].value);
+    return Number($(key === "temperature" ? "temperatureValue" : "humidityValue").textContent);
+}
+
+function setDisplayedSensorValue(key, value) {
+    if (["ph", "turbidity", "tank1", "tank2", "moisture"].includes(key)) {
+        elements[key].value = String(value);
+    } else {
+        setText(key === "temperature" ? "temperatureValue" : "humidityValue", Number(value).toFixed(1));
+    }
+}
+
+function randomizeManualSensorDecimals() {
+    Object.keys(manualSensorFields).forEach((key) => {
+        if (!state.manualSensorModes[key] || !Object.prototype.hasOwnProperty.call(state.manualSensorOverrides, key)) return;
+        const baseValue = Number(state.manualSensorOverrides[key]);
+        if (!Number.isFinite(baseValue)) return;
+        let randomizedValue;
+        if (key === "turbidity") {
+            const integerValue = Math.trunc(baseValue);
+            if (integerValue < 10) {
+                // Satuan: randomize only the ones digit.
+                randomizedValue = Math.floor(Math.random() * 10);
+            } else if (integerValue < 100) {
+                // Puluhan: randomize the tens digit and keep the ones digit.
+                randomizedValue = Math.floor(Math.random() * 10) * 10 + (integerValue % 10);
+            } else {
+                // Ratusan: keep the hundreds digit and randomize the last two.
+                const hundreds = Math.floor(integerValue / 100) * 100;
+                randomizedValue = hundreds + Math.floor(Math.random() * 100);
+            }
+            randomizedValue = Math.min(manualSensorFields[key].max, randomizedValue);
+        } else {
+            randomizedValue = Math.trunc(baseValue) + Math.floor(Math.random() * 10) / 10;
+        }
+        setDisplayedSensorValue(key, randomizedValue);
+        reportDanisSave(key, "manual", randomizedValue);
+    });
+    updateDashboard();
+}
+
+async function saveDanisSensorSetting(key, mode, value) {
+    const token = await getFirebaseIdToken();
+    const path = `${firebaseConfig.databaseURL}/ecowast/DANIS/${encodeURIComponent(key)}.json`;
+    const body = JSON.stringify({ mode, value, updatedAt: Date.now() });
+    try {
+        return await firebaseJsonRequest(`${path}?auth=${encodeURIComponent(token)}`, {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body
+        });
+    } catch (error) {
+        if (error.status !== 401) throw error;
+        const refreshedToken = await getFirebaseIdToken(true);
+        return firebaseJsonRequest(`${path}?auth=${encodeURIComponent(refreshedToken)}`, {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body
+        });
+    }
+}
+
+function getManualSensorValue(key) {
+    return state.manualSensorModes[key] && Object.prototype.hasOwnProperty.call(state.manualSensorOverrides, key)
+        ? state.manualSensorOverrides[key]
+        : getDisplayedSensorValue(key);
+}
+
+function reportDanisSave(key, mode, value) {
+    saveDanisSensorSetting(key, mode, value).then(() => {
+        $("manualSensorStatus").textContent = `Mode dan nilai ${key} tersimpan di Firebase/DANIS.`;
+    }).catch((error) => {
+        console.error(`ECOWAST failed to save DANIS/${key}:`, error);
+        $("manualSensorStatus").textContent = `Gagal menyimpan ${key} ke Firebase/DANIS.`;
+    });
+}
+
+function initializeManualSensorControls() {
+    const grid = $("manualSensorGrid");
+    if (!grid || grid.dataset.initialized) return;
+    grid.dataset.initialized = "true";
+    window.setInterval(randomizeManualSensorDecimals, 4000);
+    Object.keys(manualSensorFields).forEach((key) => {
+        state.originalSensorValues[key] = getDisplayedSensorValue(key);
+    });
+
+    const refreshRow = (key) => {
+        const row = grid.querySelector(`[data-sensor-key="${key}"]`);
+        const sourceSelect = row?.querySelector("[data-sensor-mode]");
+        if (!row || !sourceSelect) return;
+        const manual = state.manualSensorModes[key] === true;
+        const input = $(manualSensorFields[key].inputId);
+        const button = row.querySelector("[data-sensor-done]");
+        sourceSelect.value = manual ? "manual" : "original";
+        input.disabled = !manual;
+        button.disabled = !manual;
+        if (!manual || !input.value) {
+            const value = Object.prototype.hasOwnProperty.call(state.manualSensorOverrides, key)
+                ? state.manualSensorOverrides[key]
+                : getDisplayedSensorValue(key);
+            input.value = Number.isFinite(value) ? String(value) : "";
+        }
+    };
+
+    grid.querySelectorAll("[data-sensor-mode]").forEach((sourceSelect) => {
+        const key = sourceSelect.dataset.sensorMode;
+        state.manualSensorModes[key] = sourceSelect.value === "manual";
+        sourceSelect.addEventListener("change", () => {
+            const manual = sourceSelect.value === "manual";
+            state.manualSensorModes[key] = manual;
+            if (manual) {
+                const input = $(manualSensorFields[key].inputId);
+                const value = Object.prototype.hasOwnProperty.call(state.manualSensorOverrides, key)
+                    ? state.manualSensorOverrides[key]
+                    : getDisplayedSensorValue(key);
+                input.value = Number.isFinite(value) ? String(value) : "";
+                // Lock in a manual value as soon as manual mode is selected.
+                // Otherwise the next Firebase sensor update can replace the
+                // displayed value before the user presses DONE.
+                if (Number.isFinite(value)) {
+                    state.manualSensorOverrides[key] = value;
+                    setDisplayedSensorValue(key, value);
+                }
+                $("manualSensorStatus").textContent = `Mode ISI MANUAL aktif untuk ${key}. Tekan DONE untuk menerapkan nilai.`;
+            } else {
+                delete state.manualSensorOverrides[key];
+                const originalValue = state.originalSensorValues[key];
+                if (Number.isFinite(originalValue)) setDisplayedSensorValue(key, originalValue);
+                else if (key === "temperature" || key === "humidity") {
+                    setText(key === "temperature" ? "temperatureValue" : "humidityValue", "--");
+                }
+                $("manualSensorStatus").textContent = `Mode NILAI ASLI aktif untuk ${key}.`;
+            }
+            refreshRow(key);
+            updateDashboard();
+            reportDanisSave(key, manual ? "manual" : "original", getManualSensorValue(key));
+        });
+        refreshRow(key);
+    });
+
+    grid.addEventListener("click", (event) => {
+        const button = event.target.closest("[data-sensor-done]");
+        if (!button) return;
+        const key = button.dataset.sensorDone;
+        if (!state.manualSensorModes[key]) return;
+        const field = manualSensorFields[key];
+        const input = $(field.inputId);
+        const value = Number(input.value);
+        const maximum = key === "ph" && state.phIsRawAdc ? Math.max(4095, Number(elements.ph.max))
+            : key === "turbidity" && state.turbidityIsRawAdc ? Math.max(4095, Number(elements.turbidity.max))
+                : field.max;
+        if (!input.value.trim() || !Number.isFinite(value) || value < field.min || value > maximum) {
+            $("manualSensorStatus").textContent = `Nilai ${key} harus di antara ${field.min} dan ${maximum}.`;
+            input.focus();
+            return;
+        }
+        state.manualSensorOverrides[key] = value;
+        setDisplayedSensorValue(key, value);
+        input.value = String(value);
+        updateDashboard();
+        $("manualSensorStatus").textContent = `Nilai ${key} diterapkan.`;
+        reportDanisSave(key, "manual", value);
+    });
+}
+
+const moderatorPumpControls = [
+    { key: "pump1", modeId: "transferMode", mirrorModeId: "moderatorTransferMode", mirrorPumpId: "moderatorPump1" },
+    { key: "pump2", modeId: "refilterMode", mirrorModeId: "moderatorRefilterMode", mirrorPumpId: "moderatorPump2" },
+    { key: "pump3", modeId: "reservoirMode", mirrorModeId: "moderatorReservoirMode", mirrorPumpId: "moderatorPump3" },
+    { key: "pump4", modeId: "irrigationMode", mirrorModeId: "moderatorIrrigationMode", mirrorPumpId: "moderatorPump4" }
+];
+
+function syncModeratorPumpControls() {
+    moderatorPumpControls.forEach(({ key, modeId, mirrorModeId, mirrorPumpId }) => {
+        const sourceMode = $(modeId);
+        const mirrorMode = $(mirrorModeId);
+        const sourcePump = elements[key];
+        const mirrorPump = $(mirrorPumpId);
+        if (sourceMode && mirrorMode) mirrorMode.value = sourceMode.value;
+        if (sourcePump && mirrorPump) {
+            mirrorPump.textContent = sourcePump.textContent;
+            mirrorPump.classList.toggle("active", sourcePump.classList.contains("active"));
+            mirrorPump.disabled = sourcePump.disabled;
+            mirrorPump.setAttribute("aria-pressed", sourcePump.getAttribute("aria-pressed") || "false");
+        }
+    });
+}
+
+function initializeModeratorPumpControls() {
+    moderatorPumpControls.forEach(({ key, modeId, mirrorModeId, mirrorPumpId }) => {
+        const sourceMode = $(modeId);
+        const mirrorMode = $(mirrorModeId);
+        const sourcePump = elements[key];
+        if (!sourceMode || !mirrorMode || !sourcePump) return;
+        mirrorMode.addEventListener("change", () => {
+            sourceMode.value = mirrorMode.value;
+            sourceMode.dispatchEvent(new Event("change", { bubbles: true }));
+        });
+        $(mirrorPumpId).addEventListener("click", () => sourcePump.click());
+    });
+    syncModeratorPumpControls();
+}
 
 const sensorHistory = {
     ph: [],
@@ -422,10 +730,66 @@ function updatePumpButtons() {
     });
     document.querySelectorAll("#gardenScheduleList .schedule-start, #gardenScheduleList .schedule-duration")
         .forEach((input) => { input.disabled = mode !== "MANUAL"; });
+    syncModeratorPumpControls();
+    syncModeratorMonitor();
+}
+
+function syncModeratorMonitor() {
+    const copy = (targetId, sourceId, suffix = "") => {
+        const target = $(targetId);
+        const source = $(sourceId);
+        if (target && source) target.textContent = `${source.textContent.trim()}${suffix}`;
+    };
+    copy("modPh", "dataPhValue", ` ${$("dataPhUnit")?.textContent || "pH"}`);
+    copy("modTurbidity", "dataTurbidityValue", ` ${$("dataTurbidityUnit")?.textContent || "NTU"}`);
+    copy("modWaterQuality", "waterQuality");
+    copy("modPhCondition", "phCondition");
+    copy("modTurbidityState", "filterTurbidityState");
+    copy("modFlowMode", "flowMode");
+    copy("modFilterRecommendation", "filterRecommendation");
+    copy("modFilterStatus", "cleanQualityStatus");
+    copy("modTank1", "tank1Value");
+    copy("modTank2", "tank2Value");
+    copy("modReservoir", "reservoirStatus");
+    copy("modReservoirPump", "reservoirPumpState");
+    copy("modMoisture", "moistureValue");
+    copy("modPlant", "plantCondition");
+    copy("modTemperature", "temperatureValue", " C");
+    copy("modHumidity", "humidityValue", " %");
+    copy("modCapacity", "dataCapacityStatus");
+    copy("modDataSource", "dataSourceStatus");
+    copy("modPump1", "pump1");
+    copy("modPump2", "pump2");
+    copy("modPump3", "pump3");
+    copy("modPump4", "pump4");
+    copy("modUv", "uvStatus");
+    ["transferMode", "refilterMode", "reservoirMode", "irrigationMode", "gardenMode", "uvMode"]
+        .forEach((id) => {
+            const value = $(id)?.value;
+            const target = $(`mod${id[0].toUpperCase()}${id.slice(1)}`);
+            if (target && value) target.textContent = value;
+        });
+    copy("modSystemStatus", "systemStatus");
 }
 
 function updateDashboard() {
     const data = readSensors();
+    const currentValues = {
+        ph: data.ph,
+        turbidity: data.turbidity,
+        tank1: data.tank1,
+        tank2: data.tank2,
+        moisture: data.moisture,
+        temperature: Number($("temperatureValue").textContent),
+        humidity: Number($("humidityValue").textContent)
+    };
+    Object.entries(currentValues).forEach(([key, value]) => {
+        if (!state.manualSensorModes[key] && Number.isFinite(value)) {
+            state.originalSensorValues[key] = value;
+            const editor = $(manualSensorFields[key]?.inputId);
+            if (editor) editor.value = String(value);
+        }
+    });
 
     updateSensorLabels(data);
     updatePlantCondition(data.moisture);
@@ -440,6 +804,7 @@ function updateDashboard() {
     updatePumpButtons();
     updateLCD(data, waterPassed);
     updateDataPage(data);
+    syncModeratorMonitor();
 }
 
 function updateGaugeCard(cardId, valueId, value, min, max, displayValue, unit) {
@@ -1200,8 +1565,12 @@ function applyFirebaseSensorData(sensorData, statusData = null) {
             : inputKey === "turbidity" ? 500
                     : 100;
         const clampedValue = Math.min(maxValue, Math.max(0, value));
+        state.originalSensorValues[inputKey] = clampedValue;
         input.max = String(maxValue);
-        input.value = String(clampedValue);
+        const effectiveValue = state.manualSensorModes[inputKey] && Object.prototype.hasOwnProperty.call(state.manualSensorOverrides, inputKey)
+            ? state.manualSensorOverrides[inputKey]
+            : clampedValue;
+        input.value = String(effectiveValue);
         input.disabled = true;
         updated++;
     });
@@ -1212,8 +1581,18 @@ function applyFirebaseSensorData(sensorData, statusData = null) {
     const hasTemperature = Number.isFinite(temperature) && temperature >= 0;
     const hasHumidity = Number.isFinite(humidity) && humidity >= 0 && statusData?.dhtValid !== 0 && dhtData.valid !== false;
     const hasValidTemperature = hasTemperature && dhtData.valid !== false;
-    if (hasValidTemperature) setText("temperatureValue", temperature.toFixed(1));
-    if (hasHumidity) setText("humidityValue", humidity.toFixed(1));
+    if (hasValidTemperature) {
+        state.originalSensorValues.temperature = temperature;
+        const effectiveTemperature = state.manualSensorModes.temperature && Object.prototype.hasOwnProperty.call(state.manualSensorOverrides, "temperature")
+            ? state.manualSensorOverrides.temperature : temperature;
+        setText("temperatureValue", effectiveTemperature.toFixed(1));
+    }
+    if (hasHumidity) {
+        state.originalSensorValues.humidity = humidity;
+        const effectiveHumidity = state.manualSensorModes.humidity && Object.prototype.hasOwnProperty.call(state.manualSensorOverrides, "humidity")
+            ? state.manualSensorOverrides.humidity : humidity;
+        setText("humidityValue", effectiveHumidity.toFixed(1));
+    }
     if (!updated) throw new Error("SENSOR_DATA_MISSING");
     [elements.ph, elements.turbidity, elements.moisture, elements.tank1, elements.tank2]
         .forEach((input) => { input.disabled = true; });
@@ -1345,6 +1724,7 @@ async function syncFirebaseSensors() {
         else if (/SENSOR_DATA_MISSING/.test(message)) status = "FIREBASE DATA MISSING";
 
         setText("dataSourceStatus", status);
+        syncModeratorMonitor();
         if (!state.firebaseDataLoaded) {
             [elements.ph, elements.turbidity, elements.moisture, elements.tank1, elements.tank2]
                 .forEach((input) => { input.disabled = false; });
@@ -1354,16 +1734,4 @@ async function syncFirebaseSensors() {
     }
 }
 
-updateDashboard();
-updateWelcomeDate();
-initializeProfileSettings();
-initializeSensorCarousel();
-initializePageSelector();
-initializeAutomationSettings();
-syncFirebaseSensors();
-setInterval(syncFirebaseSensors, 2000);
-updateClock();
-setInterval(updateClock, 1000);
-window.addEventListener("resize", updateDashboard);
-
-console.info("ECOWAST interface initialized — simulation mode.");
+if (!initializeLogin()) initializeDashboard();
